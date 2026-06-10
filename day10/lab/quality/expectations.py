@@ -10,6 +10,17 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
+# Nguồn tối thiểu để pass bộ grading 10 câu (đồng bộ grading_questions.json).
+REQUIRED_DOC_IDS_FOR_GRADING = frozenset(
+    {
+        "policy_refund_v4",
+        "sla_p1_2026",
+        "it_helpdesk_faq",
+        "hr_leave_policy",
+        "access_control_sop",
+    }
+)
+
 
 @dataclass
 class ExpectationResult:
@@ -109,6 +120,52 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
             ok6,
             "halt",
             f"violations={len(bad_hr_annual)}",
+        )
+    )
+
+    # E7 (mới): đủ nguồn cho grading — mỗi doc_id bắt buộc có ≥1 chunk
+    present = {r.get("doc_id") for r in cleaned_rows}
+    missing = sorted(REQUIRED_DOC_IDS_FOR_GRADING - present)
+    ok7 = len(missing) == 0
+    results.append(
+        ExpectationResult(
+            "grading_sources_coverage",
+            ok7,
+            "halt",
+            f"missing_doc_ids={missing}",
+        )
+    )
+
+    # E8 (mới): HR phải có ít nhất một chunk chính sách 2026 (12 ngày)
+    hr_12 = [
+        r
+        for r in cleaned_rows
+        if r.get("doc_id") == "hr_leave_policy"
+        and "12 ngày phép năm" in (r.get("chunk_text") or "")
+    ]
+    ok8 = len(hr_12) >= 1
+    results.append(
+        ExpectationResult(
+            "hr_has_current_12d_annual",
+            ok8,
+            "halt",
+            f"current_hr_chunks={len(hr_12)}",
+        )
+    )
+
+    # E9 (mới): không còn prefix export lỗi sau clean
+    unclear = [
+        r
+        for r in cleaned_rows
+        if (r.get("chunk_text") or "").lower().startswith("nội dung không rõ ràng")
+    ]
+    ok9 = len(unclear) == 0
+    results.append(
+        ExpectationResult(
+            "no_unclear_export_prefix",
+            ok9,
+            "warn",
+            f"unclear_prefix_rows={len(unclear)}",
         )
     )
 

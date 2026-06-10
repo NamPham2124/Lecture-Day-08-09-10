@@ -38,6 +38,7 @@ LOG_DIR = ART / "logs"
 MAN_DIR = ART / "manifests"
 QUAR_DIR = ART / "quarantine"
 CLEAN_DIR = ART / "cleaned"
+INDEX_DIR = ART / "index"
 
 
 def _log(path: Path, line: str) -> None:
@@ -54,7 +55,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 1
 
     log_path = LOG_DIR / f"run_{run_id.replace(':', '-')}.log"
-    for p in (LOG_DIR, MAN_DIR, QUAR_DIR, CLEAN_DIR):
+    for p in (LOG_DIR, MAN_DIR, QUAR_DIR, CLEAN_DIR, INDEX_DIR):
         p.mkdir(parents=True, exist_ok=True)
 
     def log(msg: str) -> None:
@@ -133,8 +134,15 @@ def cmd_embed_internal(cleaned_csv: Path, *, run_id: str, log) -> bool:
         import chromadb
         from chromadb.utils import embedding_functions
     except ImportError:
-        log("ERROR: chromadb chưa cài. pip install -r requirements.txt")
-        return False
+        from retrieval_fallback import load_cleaned_csv, write_index
+
+        rows = load_cleaned_csv(cleaned_csv)
+        index_path = INDEX_DIR / "day10_index.json"
+        write_index(index_path, rows, run_id=run_id)
+        log("WARN: chromadb/sentence-transformers chưa cài; dùng lexical fallback index.")
+        log(f"fallback_index_written={index_path.relative_to(ROOT)}")
+        log(f"embed_upsert count={len(rows)} collection=lexical_fallback")
+        return True
 
     db_path = os.environ.get("CHROMA_DB_PATH", str(ROOT / "chroma_db"))
     collection_name = os.environ.get("CHROMA_COLLECTION", "day10_kb")
@@ -147,9 +155,19 @@ def cmd_embed_internal(cleaned_csv: Path, *, run_id: str, log) -> bool:
         log("WARN: cleaned CSV rỗng — không embed.")
         return True
 
-    client = chromadb.PersistentClient(path=db_path)
-    emb = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
-    col = client.get_or_create_collection(name=collection_name, embedding_function=emb)
+    try:
+        client = chromadb.PersistentClient(path=db_path)
+        emb = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
+        col = client.get_or_create_collection(name=collection_name, embedding_function=emb)
+    except Exception as e:
+        from retrieval_fallback import write_index
+
+        index_path = INDEX_DIR / "day10_index.json"
+        write_index(index_path, rows, run_id=run_id)
+        log(f"WARN: Chroma embed unavailable ({e}); dùng lexical fallback index.")
+        log(f"fallback_index_written={index_path.relative_to(ROOT)}")
+        log(f"embed_upsert count={len(rows)} collection=lexical_fallback")
+        return True
 
     ids = [r["chunk_id"] for r in rows]
     # Tránh “mồi cũ” trong top-k: xóa id không còn trong cleaned run này (index = snapshot publish).

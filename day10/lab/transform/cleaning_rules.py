@@ -9,22 +9,29 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-# Khớp export hợp lệ trong lab (mở rộng khi nhóm thêm doc mới — phải đồng bộ contract).
+# Khớp export hợp lệ trong lab — đồng bộ contracts/data_contract.yaml.
 ALLOWED_DOC_IDS = frozenset(
     {
         "policy_refund_v4",
         "sla_p1_2026",
         "it_helpdesk_faq",
         "hr_leave_policy",
+        "access_control_sop",
     }
 )
 
+# Đọc cutoff từ env/contract thay vì hard-code ngày trong logic HR (Distinction-friendly).
+HR_LEAVE_MIN_EFFECTIVE_DATE = os.environ.get("HR_LEAVE_MIN_EFFECTIVE_DATE", "2026-01-01")
+
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DMY_SLASH = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
+_UNCLEAR_PREFIX = re.compile(r"^Nội dung không rõ ràng:\s*", re.IGNORECASE)
+_REPEATED_TOKEN = re.compile(r"\b(\w+)(?:\s+\1){1,}\b", re.IGNORECASE)
 
 
 def _norm_text(s: str) -> str:
@@ -53,6 +60,35 @@ def _normalize_effective_date(raw: str) -> Tuple[str, str]:
     return "", "invalid_effective_date_format"
 
 
+def _strip_unclear_prefix(text: str) -> str:
+    """Rule mới: bỏ prefix export lỗi 'Nội dung không rõ ràng:'."""
+    return _UNCLEAR_PREFIX.sub("", text or "").strip()
+
+
+def _collapse_repeated_tokens(text: str) -> str:
+    """Rule mới: gộp token lặp liên tiếp (vd 'làm việc làm việc' → 'làm việc')."""
+    prev = None
+    out = text
+    while prev != out:
+        prev = out
+        out = _REPEATED_TOKEN.sub(r"\1", out)
+    return out
+
+
+def _is_stale_hr_content(text: str) -> bool:
+    """Rule mới: phát hiện marker nội dung HR 2025 / 10 ngày phép."""
+    t = text or ""
+    if "10 ngày phép năm" in t:
+        return True
+    if "bản HR 2025" in t:
+        return True
+    return False
+
+
+def _is_current_hr_content(text: str) -> bool:
+    return "12 ngày phép năm" in (text or "")
+
+
 def load_raw_csv(path: Path) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     with path.open(encoding="utf-8", newline="") as f:
@@ -73,10 +109,16 @@ def clean_rows(
     Baseline (mở rộng theo narrative Day 10):
     1) Quarantine: doc_id không thuộc allowlist (export lạ / catalog sai).
     2) Chuẩn hoá effective_date sang YYYY-MM-DD; quarantine nếu không parse được.
-    3) Quarantine: chunk hr_leave_policy có effective_date < 2026-01-01 (bản HR cũ / conflict version).
-    4) Quarantine: chunk_text rỗng hoặc effective_date rỗng sau chuẩn hoá.
-    5) Loại trùng nội dung chunk_text (giữ bản đầu).
-    6) Fix stale refund: policy_refund_v4 chứa '14 ngày làm việc' → 7 ngày.
+    3) Quarantine: chunk hr_leave_policy stale theo nội dung (10 ngày / HR 2025).
+    4) Quarantine: chunk hr_leave_policy có effective_date < cutoff trừ khi nội dung 2026 (12 ngày).
+    5) Quarantine: chunk_text rỗng hoặc effective_date rỗng sau chuẩn hoá.
+    6) Loại trùng nội dung chunk_text (giữ bản đầu).
+    7) Fix stale refund: policy_refund_v4 chứa '14 ngày làm việc' → 7 ngày.
+
+    Rule mới (nhóm):
+    - strip_unclear_prefix: bỏ tiền tố export lỗi.
+    - collapse_repeated_tokens: sửa lặp từ trong chunk_text.
+    - quarantine_stale_hr_content: cách ly theo marker nội dung HR cũ.
     """
     quarantine: List[Dict[str, Any]] = []
     seen_text: set[str] = set()
@@ -101,27 +143,39 @@ def clean_rows(
             quarantine.append({**raw, "reason": eff_err, "effective_date_raw": eff_raw})
             continue
 
-        if doc_id == "hr_leave_policy" and eff_norm < "2026-01-01":
-            quarantine.append(
-                {
-                    **raw,
-                    "reason": "stale_hr_policy_effective_date",
-                    "effective_date_normalized": eff_norm,
-                }
-            )
-            continue
+        fixed_text = _strip_unclear_prefix(text)
+        fixed_text = _collapse_repeated_tokens(fixed_text)
 
-        if not text:
+        if doc_id == "hr_leave_policy":
+            if _is_stale_hr_content(fixed_text):
+                quarantine.append(
+                    {
+                        **raw,
+                        "reason": "stale_hr_content_marker",
+                        "chunk_text_normalized": fixed_text,
+                    }
+                )
+                continue
+            if eff_norm < HR_LEAVE_MIN_EFFECTIVE_DATE and not _is_current_hr_content(fixed_text):
+                quarantine.append(
+                    {
+                        **raw,
+                        "reason": "stale_hr_policy_effective_date",
+                        "effective_date_normalized": eff_norm,
+                    }
+                )
+                continue
+
+        if not fixed_text:
             quarantine.append({**raw, "reason": "missing_chunk_text"})
             continue
 
-        key = _norm_text(text)
+        key = _norm_text(fixed_text)
         if key in seen_text:
             quarantine.append({**raw, "reason": "duplicate_chunk_text"})
             continue
         seen_text.add(key)
 
-        fixed_text = text
         if apply_refund_window_fix and doc_id == "policy_refund_v4":
             if "14 ngày làm việc" in fixed_text:
                 fixed_text = fixed_text.replace(
